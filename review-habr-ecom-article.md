@@ -1,86 +1,146 @@
-# Review: "Grep-AST: Replacing Vector Search with One Library"
+# Разбор статьи: «Grep-AST: заменяем векторный поиск одной библиотекой»
 
-**Source:** https://habr.com/ru/companies/ecom_tech/articles/1005610/
-**Author:** ecom.tech
-
----
-
-## Summary
-
-The article describes how ecom.tech engineers replaced a RAG (Retrieval-Augmented Generation) pipeline with **grep-ast** — a Python library that combines grep-style search with tree-sitter's Abstract Syntax Tree (AST) parsing — for automated extraction of REST API endpoints and Kafka message producers/consumers from multi-language repositories.
+**Источник:** https://habr.com/ru/companies/ecom_tech/articles/1005610/
+**Автор:** Софья Ермакова, команда LLM-приложений ecom.tech
 
 ---
 
-## Problem
+## Контекст и постановка задачи
 
-The team needed to reverse-engineer API and Kafka documentation from codebases written in **Golang, Kotlin, Ruby, Elixir, and PHP**. The challenge: framework wrappers and DSLs make endpoint/handler detection structurally non-trivial.
+Команда ecom.tech занимается автоматизацией reverse engineering документации: нужно извлекать описания REST API-эндпоинтов и Kafka-продюсеров/консьюмеров из сотен микросервисов. Стек разнородный — **Golang, Kotlin, Ruby, Elixir, PHP**, — и при этом каждый язык использует собственные фреймворки с разными соглашениями об именовании и структуре кода.
 
----
-
-## Approaches Tried (and Why They Failed)
-
-| Approach | Problem |
-|---|---|
-| **Direct tree-sitter** | Framework abstractions look like plain functions; high false-positive rate |
-| **RAG with gte-multilingual-base embeddings** | Only 85% accuracy; slow; hard to debug |
-| **Regex + grep** | Brittle; breaks on comments, string literals, formatting variations |
+Требования к инструменту:
+- точно находить эндпоинты и обработчики событий, следуя корпоративным архитектурным стандартам;
+- работать на нескольких языках без ручной настройки под каждый;
+- легко интегрироваться в LLM-агент как tool call.
 
 ---
 
-## Solution: grep-ast
+## Что пробовали раньше и почему не получилось
 
-[grep-ast](https://github.com/paul-gauthier/grep-ast) — created by Paul Gauthier (author of Aider) — searches code using regex patterns but returns results **within their full AST context**: the enclosing function, class, and structural scope, rather than isolated matching lines.
+### 1. Прямое использование tree-sitter
 
-### Key properties
+Tree-sitter умеет строить AST, но семантика фреймворков скрыта за обёртками и DSL. В Ruby и Elixir метапрограммирование делает вызовы фреймворков синтаксически неотличимыми от обычных функций. Итог: **много ложных срабатываний и пропущенных эндпоинтов**.
 
-- **Structural context:** Results include the full containing code block (function/class/module)
-- **Multi-language:** Supports 30+ languages via tree-sitter grammars
-- **Simple interface:** CLI mirrors `grep` usage — low learning curve
-- **Interpretable output:** Search patterns and navigation decisions are fully logged and traceable
+### 2. RAG-пайплайн
 
-### Usage in an LLM agent
+Классическая схема: чанкинг кода → эмбеддинги (модель `gte-multilingual-base`) → векторный поиск. Затем добавили гибридный вариант с BM-25-реранкингом. Итог: средняя точность по всем языкам — **85%**, при этом поиск медленный, нужные файлы всё равно иногда не попадали в выборку.
 
-The library is wired up as a **tool call** for an LLM agent, enabling iterative, multi-step code exploration. The agent issues grep-ast queries, inspects structural results, and narrows its search — mimicking how a developer manually navigates a codebase.
+### 3. Regex + grep
 
----
-
-## Core Insight
-
-> Not every code-search task needs a vector store.
-
-When the target is a **precise structural element** (endpoints, event producers, specific decorators), AST-aware search outperforms semantic embeddings on:
-
-- **Accuracy** (exact structural matches vs. approximate similarity)
-- **Speed** (no embedding inference or vector index)
-- **Debuggability** (patterns are readable; results are deterministic)
-- **Maintainability** (no vector index to refresh as code changes)
+Казалось бы, самое простое решение. Но:
+- нужно отфильтровывать комментарии, строковые литералы, аннотации типов;
+- паттерны ломались при малейшем изменении форматирования декораторов или аннотаций;
+- поддержка пяти языков превращала набор регулярок в плохо поддерживаемое решение.
 
 ---
 
-## Assessment
+## Что такое grep-ast
 
-### Strengths
+[grep-ast](https://github.com/paul-gauthier/grep-ast) — Python-библиотека за авторством **Пола Готье** (создатель Aider). Идея проста: ищем по коду регулярным выражением, как grep, но возвращаем результат **в полном AST-контексте** — целиком функцию или класс, которые содержат совпадение, с указанием их иерархии.
 
-- Practical, well-motivated engineering decision — not chasing hype
-- Clear comparison of alternatives with concrete failure modes
-- Useful framing: grep-ast as an LLM tool call rather than one-shot retrieval
-- Highlights an underappreciated library from the Aider ecosystem
+### Что даёт AST-контекст
 
-### Weaknesses / Open Questions
+Сравнение на практике:
 
-- 85% RAG accuracy is cited but no equivalent precision/recall figure is given for grep-ast — makes the win hard to quantify
-- No discussion of **false negatives**: patterns that structural search would miss (e.g., dynamically registered routes, metaprogramming-heavy Ruby code)
-- The article is light on implementation detail — how the agent prompt is structured and how tool results feed back into reasoning would strengthen it
-- Multi-language pattern management (different decorator/annotation conventions per language) is mentioned but not elaborated
+**Обычный grep:**
+```
+controllers/orders.go:42:  func HandleCreateOrder(w http.ResponseWriter, r *http.Request) {
+```
+Видим строку и номер — остальное нужно искать руками: в каком пакете, в какой структуре, какой путь маршрута.
 
-### Verdict
+**grep-ast:**
+```
+controllers/orders.go
+  class OrdersController:           ← знаем структуру
+    def handle_create_order(...)    ← видим сигнатуру целиком
+      """POST /orders — создание заказа"""   ← docstring сразу
+      ...тело метода...
+```
 
-A concise, pragmatic article. The key message — "match the retrieval method to the structural nature of the target" — is sound and underrepresented in LLM tooling discussions. Worth reading for teams building code-intelligence agents.
+Ключевая формулировка из статьи:
+> «Grep отвечает на вопрос "где встречается этот текст", а grep-ast — на вопрос "какие части программы это поддерживают"».
+
+### Технические характеристики
+
+- Рекурсивный обход репозитория с уважением `.gitignore`
+- Поддержка **30+ языков** через `tree-sitter-languages`
+- CLI-интерфейс, синтаксически идентичный grep — минимальный порог входа
+- Результаты группируются по файлу и показывают полную структурную иерархию
 
 ---
 
-## Takeaways for Practitioners
+## grep-ast vs ast-grep — важное различие
 
-1. Before reaching for embeddings + vector search, ask: **is the target structurally well-defined?** If yes, AST-based search is simpler, faster, and more reliable.
-2. grep-ast is a practical drop-in for code-navigation tool calls in LLM agents.
-3. Accuracy benchmarks should be reported for both baseline and proposed approaches — not just the baseline.
+Статья специально разбирает путаницу между двумя похожими по названию инструментами:
+
+| Критерий | grep-ast | ast-grep |
+|---|---|---|
+| Язык реализации | Python | Rust |
+| Производительность | Умеренная | Очень высокая |
+| Основная задача | Поиск с AST-контекстом | Поиск + замена + линтинг |
+| Паттерны | Regex по тексту | Структурные AST-паттерны |
+| Рефакторинг кода | Нет | Да (интерактивный codemod) |
+| Пользовательские правила | Нет | Да (YAML-конфиги) |
+| Интерфейсы | CLI | CLI + Node.js API + LSP |
+
+**Вывод:** ast-grep — мощнее, но сложнее и предназначен для другого класса задач (рефакторинг, линтинг). grep-ast решает ровно одну задачу — поиск с контекстом — и делает это просто и надёжно.
+
+---
+
+## Интеграция в LLM-агент
+
+Главная архитектурная идея статьи: grep-ast используется не как одноразовый ретривер, а как **инструмент (tool call) для итеративной навигации по коду**.
+
+### Как это работает
+
+1. LLM-агент получает доступ к grep-ast как к функции.
+2. Вместо того чтобы получить набор чанков и «угадывать» по ним, модель действует как разработчик: ищет контроллеры, смотрит методы, переходит к DTO, уточняет продюсеры Kafka.
+3. Каждый вызов grep-ast логируется: какой паттерн, какие файлы, куда пошло исследование дальше.
+
+### Преимущество трассируемости
+
+Цепочка рассуждений агента становится **полностью видимой**:
+```
+1. grep-ast "Router\|router" → нашли файлы роутинга
+2. grep-ast "POST.*orders" → нашли обработчик заказов
+3. grep-ast "OrderService" → нашли бизнес-логику
+4. grep-ast "kafka.*Produce" → нашли Kafka-продюсер
+```
+
+Это принципиально отличается от RAG: там непонятно, почему модель получила именно эти чанки и почему дала именно такой ответ.
+
+---
+
+## Оценка статьи
+
+### Сильные стороны
+
+- **Прагматичный инжиниринг**: команда последовательно попробовала три подхода, зафиксировала конкретные проблемы каждого и только потом выбрала решение — без хайпа и без «давайте сразу LLM».
+- **Полезное разграничение**: сравнение grep-ast и ast-grep снимает реальную путаницу, которая возникает у большинства читателей.
+- **Нестандартное применение**: grep-ast как tool call агента, а не как ретривер — это важный архитектурный паттерн, который мало где описан.
+- **Акцент на трассируемость**: это недооценённое преимущество детерминированных инструментов перед векторным поиском.
+
+### Слабые стороны и открытые вопросы
+
+1. **Нет цифр для grep-ast.** RAG-пайплайн получил 85% — а какова точность grep-ast? Без этого сравнение неполное. Победа декларируется, но не измеряется.
+
+2. **Ложные отрицания не рассмотрены.** Что происходит с динамически регистрируемыми маршрутами (например, в Ruby on Rails с `resources :orders`)? С метапрограммированием в Elixir, где эндпоинты генерируются макросами? AST-поиск по тексту их просто не найдёт.
+
+3. **Управление паттернами для пяти языков.** В статье упоминается, что у каждого языка своя нотация декораторов/аннотаций, но не объясняется, как хранятся и поддерживаются эти паттерны. Это критичная инженерная деталь.
+
+4. **Промпт агента не раскрыт.** Сказано, что grep-ast подключается как tool call, но не показано, как агент получает инструкцию итеративно исследовать код, а не делать один запрос.
+
+5. **Масштаб не указан.** «Сотни микросервисов» — сколько файлов? Как ведёт себя grep-ast на репозитории из 500k строк кода?
+
+---
+
+## Итоговые выводы для практиков
+
+1. **Сначала спросите: структурно ли определена цель поиска?** Если вы ищете классы, декораторы, специфические паттерны — AST-поиск точнее, быстрее и проще в отладке, чем эмбеддинги.
+
+2. **grep-ast — хороший tool call для LLM-агентов**, работающих с кодовой базой. Итеративная навигация по коду надёжнее, чем одноразовый RAG-ретривер.
+
+3. **Трассируемость — это фича, а не приятный бонус.** Детерминированный, логируемый инструмент делает поведение агента понятным и отлаживаемым.
+
+4. **Измеряйте оба конца сравнения.** Если вы публикуете результаты, приводите цифры как для baseline, так и для нового решения.
